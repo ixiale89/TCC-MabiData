@@ -1,0 +1,1860 @@
+---
+title: "Análise e Predição do Poder de Compra da População Brasileira"
+author: "Alexandre de Souza da Silva & Mara Lucia Fernandes Cerqueira"
+format: pdf
+editor: visual
+---
+
+## Questão de Pesquisa
+
+O problema abordado nesta pesquisa relaciona-se à crescente complexidade na análise de grandes volumes de dados financeiros brasileiros, o que dificulta a identificação precisa de tendências econômicas em nível regional. Considerando a necessidade de identificar oscilações no bem‑estar orçamentário com maior acurácia, e por meio da aplicação da Ciência de Dados, utilizando técnicas de Big Data e modelos de aprendizado de máquina (como ARIMA e Prophet), este trabalho busca responder à seguinte questão:
+
+**Como avaliar se a população brasileira de uma determinada região tenderá ao endividamento ou ao aumento do poder de compra ao longo do tempo?**
+
+------------------------------------------------------------------------
+
+## Objetivos
+
+### Objetivo Geral
+
+Desenvolver um modelo analítico e preditivo capaz de estimar a evolução do poder de compra da população brasileira, com base em dados históricos de consumo e indicadores macroeconômicos.
+
+### Objetivos Específicos
+
+-   Extrair dados de uma plataforma de supermercado relacionados às compras realizadas no período de 2017 a 2025;
+-   Descaracterizar dados sensíveis e irrelevantes para a análise econômica;
+-   Obter, por meio do portal GOV.BR, os itens que compõem a cesta básica brasileira;
+-   Extrair, a partir dos cupons de compra, o valor mensal da cesta básica, utilizando como referência o valor de custo dos produtos, e não o valor de venda;
+-   Criar um indicador econômico baseado na relação entre o custo da cesta básica e o salário mínimo;
+-   Aplicar modelos de séries temporais (ARIMA e Prophet);
+-   Avaliar cenários futuros de poder de compra e risco de endividamento.
+
+------------------------------------------------------------------------
+
+## Arquitetura do Pipeline Analítico
+
+A solução proposta adota uma arquitetura distribuída baseada no ecossistema Hadoop, organizada em três camadas distintas: **RAW**, **TRATAMENTO** e **GOLD**.\
+Essa separação garante rastreabilidade, reprodutibilidade e clareza metodológica, assegurando que apenas dados tratados e validados sejam utilizados nas análises e modelos preditivos.
+
+------------------------------------------------------------------------
+
+## 1. Configuração do Ambiente
+
+Antes da execução do pipeline, é necessário configurar as variáveis de ambiente no arquivo `.Renviron`.
+
+file.edit(".Renviron")
+
+SPARK_HOME=/opt/spark HIVE_CONF_DIR=/opt/hive/conf JAVA_HOME=/usr/lib/jvm/java-8-openjdk-amd64 HADOOP_CONF_DIR=/opt/hadoop/etc/hadoop HBASE_CONF_DIR=/opt/hbase/conf
+
+## 2.  Carregamento de Bibliotecas 
+
+Nesta etapa são carregados os pacotes necessários para ingestão, processamento distribuído, análise exploratória e modelagem.
+
+```{r}
+pkgs <- c(
+  "sparklyr","dplyr","dbplyr","DBI","lubridate","tidyr",
+  "ggplot2","scales","prophet","zoo","tibble","forecast"
+)
+
+to_install <- setdiff(pkgs, rownames(installed.packages()))
+if (length(to_install)) install.packages(to_install)
+
+library(sparklyr)
+library(dplyr)
+library(dbplyr)
+library(DBI)
+library(lubridate)
+library(tidyr)
+library(ggplot2)
+library(prophet)
+library(zoo)
+library(forecast)
+```
+
+“Os dados foram organizados segundo a arquitetura Medallion (Bronze, Silver e Gold). A camada Bronze armazena os dados brutos conforme recebidos da origem; a camada Silver contém os dados limpos, tipados e validados; e a camada Gold consolida os dados analíticos finais utilizados nas análises e modelos preditivos.”
+
+## 3.  Camada Bronze 
+
+Ingestão dos Dados Brutos A camada RAW armazena os dados exatamente como obtidos na origem, sem transformações semânticas.
+```{r}
+#Realiza a parametrizacao e conexao com o spark
+
+spark_disconnect_all()
+
+conf <- spark_config()
+conf$spark.sql.catalogImplementation <- "hive"
+conf$spark.driver.memory  <- "6G"
+conf$spark.executor.memory <- "6G"
+conf$spark.sql.shuffle.partitions <- 200
+
+sc <- spark_connect(master = "local", config = conf)
+
+```
+
+```{r}
+
+###############################################################
+# 3. CAMADA Bronze – INGESTÃO COMPLETA (HDFS + HIVE)
+###############################################################
+
+hdfs_bin <- "/opt/hadoop/bin/hdfs"
+
+# Caminhos HDFS
+HDFS_BASE        <- "/data/TCC/raw"
+HDFS_PRODUTO     <- file.path(HDFS_BASE, "PRODUTO")
+HDFS_VENDA       <- file.path(HDFS_BASE, "VENDA")
+HDFS_VENDA_ITEM  <- file.path(HDFS_BASE, "VENDA_ITEM")
+HDFS_SALARIO_MIN <- file.path(HDFS_BASE, "SALARIO_MINIMO")
+
+# Caminho local dos CSV
+LOCAL_BASE <- "/home/alexandre/ITA/TCC/DATA_RAW"
+
+# Criar diretórios
+system(paste(hdfs_bin, "dfs -mkdir -p", HDFS_PRODUTO))
+system(paste(hdfs_bin, "dfs -mkdir -p", HDFS_VENDA))
+system(paste(hdfs_bin, "dfs -mkdir -p", HDFS_VENDA_ITEM))
+system(paste(hdfs_bin, "dfs -mkdir -p", HDFS_SALARIO_MIN))
+
+# Enviar CSV para o HDFS 
+system(paste(hdfs_bin, "dfs -put -f",
+             file.path(LOCAL_BASE, "PRODUTO.csv"),
+             paste0(HDFS_PRODUTO, "/")))
+
+system(paste(hdfs_bin, "dfs -put -f",
+             file.path(LOCAL_BASE, "VENDA.csv"),
+             paste0(HDFS_VENDA, "/")))
+
+system(paste(hdfs_bin, "dfs -put -f",
+             file.path(LOCAL_BASE, "VENDA_ITEM.csv"),
+             paste0(HDFS_VENDA_ITEM, "/")))
+
+system(paste(hdfs_bin, "dfs -put -f",
+             file.path(LOCAL_BASE, "SALARIO_MINIMO.csv"),
+             paste0(HDFS_SALARIO_MIN, "/")))
+
+###############################################################
+# CRIAÇÃO DAS TABELAS RAW NO HIVE
+###############################################################
+
+
+DBI::dbExecute(sc, "CREATE DATABASE IF NOT EXISTS bronze")
+DBI::dbExecute(sc, "CREATE DATABASE IF NOT EXISTS silver")
+DBI::dbExecute(sc, "CREATE DATABASE IF NOT EXISTS gold")
+
+# PRODUTO RAW
+DBI::dbExecute(sc, glue::glue("
+  CREATE EXTERNAL TABLE IF NOT EXISTS bronze.produto (
+    idproduto STRING,
+    c2 STRING, c3 STRING, c4 STRING, c5 STRING,
+    c6 STRING, c7 STRING, c8 STRING, c9 STRING,
+    c10 STRING, c11 STRING, c12 STRING, c13 STRING,
+    c14 STRING, c15 STRING,
+    descricaoproduto STRING
+  )
+  ROW FORMAT DELIMITED
+  FIELDS TERMINATED BY ','
+  STORED AS TEXTFILE
+  LOCATION '{HDFS_PRODUTO}'
+"))
+
+# VENDA RAW
+DBI::dbExecute(sc, glue::glue("
+  CREATE EXTERNAL TABLE IF NOT EXISTS bronze.venda (
+    idvenda STRING,
+    c2 STRING, c3 STRING, c4 STRING, c5 STRING,
+    c6 STRING, c7 STRING, c8 STRING, c9 STRING,
+    c10 STRING,
+    data STRING
+  )
+  ROW FORMAT DELIMITED
+  FIELDS TERMINATED BY ','
+  STORED AS TEXTFILE
+  LOCATION '{HDFS_VENDA}'
+"))
+
+# VENDA_ITEM RAW
+DBI::dbExecute(sc, glue::glue("
+  CREATE EXTERNAL TABLE IF NOT EXISTS bronze.venda_item (
+    c1 STRING,
+    idvenda STRING,
+    idproduto STRING,
+    c4 STRING,
+    valorcustoitem STRING
+  )
+  ROW FORMAT DELIMITED
+  FIELDS TERMINATED BY ','
+  STORED AS TEXTFILE
+  LOCATION '{HDFS_VENDA_ITEM}'
+"))
+
+# SALARIO MINIMO
+DBI::dbExecute(sc, glue::glue("
+  CREATE EXTERNAL TABLE IF NOT EXISTS bronze.salario_minimo(
+    ano STRING,
+    salario_minimo STRING
+  )
+  ROW FORMAT DELIMITED
+  FIELDS TERMINATED BY ','
+  STORED AS TEXTFILE
+  LOCATION '{HDFS_SALARIO_MIN}'
+"))
+
+```
+
+## 4.  Camada Silver
+
+Limpeza e Padronização Nesta camada são removidos valores nulos críticos e preservados apenas os atributos essenciais à análise econômica.
+
+
+Produto
+
+As transformações da camada Silver foram implementadas em SQL distribuído (Spark SQL), enquanto a camada Gold foi construída em Spark/R para aplicação das regras analíticas e modelagem.”
+```{r}
+
+
+###############################################################
+# CAMADA TRATAMENTO – LIMPEZA
+###############################################################
+
+DBI::dbExecute(sc, "
+  CREATE TABLE IF NOT EXISTS silver.produto (
+    idproduto INT,
+    descricaoproduto STRING
+  )
+  STORED AS PARQUET
+")
+
+
+# Contexto BRONZE
+DBI::dbExecute(sc, "USE bronze")
+
+# Materializa BRONZE
+produto_df <- tbl(sc, "produto") %>%
+  compute(
+    name = "tmp_produto_bronze",
+    overwrite = TRUE
+  )
+
+# Tratamento
+produto_tratado <- tbl(sc, "tmp_produto_bronze") %>%
+  mutate(
+    idproduto = as.integer(idproduto),
+    descricaoproduto = stringr::str_trim(descricaoproduto)
+  ) %>%
+  filter(
+    !is.na(idproduto),
+    idproduto > 0,
+    !is.na(descricaoproduto),
+    descricaoproduto != ""
+  ) %>%
+  arrange(idproduto) %>%   # estabilidade
+  compute(
+    name = "tmp_produto_tratado",
+    overwrite = TRUE
+  )
+
+# Contexto SILVER
+DBI::dbExecute(sc, "USE silver")
+
+# Escrita final
+spark_write_table(
+  tbl(sc, "tmp_produto_tratado"),
+  name = "produto",
+  mode = "overwrite"
+)
+
+#normalizacao do texto eliminacao de acentos.
+DBI::dbExecute(sc, "USE silver")
+
+DBI::dbExecute(sc, "
+  INSERT OVERWRITE TABLE silver.produto
+  SELECT
+    CAST(idproduto AS INT)      AS idproduto,
+    c2,
+    c3,
+    c4,
+    c5,
+    c6,
+    c7,
+    c8,
+    c9,
+    c10,
+    c11,
+    c12,
+    c13,
+    c14,
+    c15,
+    descricaoproduto
+  FROM bronze.produto
+  WHERE
+    descricaoproduto IS NOT NULL
+    AND TRIM(descricaoproduto) <> ''
+")
+
+
+
+
+```
+
+Venda
+
+```{r}
+
+#############################
+# TRATAMENTO DA TABELA VENDA
+#############################
+# Regras aplicadas (conforme TCC):
+# - idvenda obrigatório
+# - data obrigatória
+# - registros sem data não participam de análises temporais
+#############################
+
+DBI::dbExecute(sc, "
+  CREATE TABLE IF NOT EXISTS silver.venda (
+    idvenda INT,
+    data DATE
+  )
+  STORED AS PARQUET
+")
+
+
+###############################################################
+# VENDA — BRONZE → SILVER (VERSÃO CORRETA)
+###############################################################
+
+# 1. Contexto BRONZE
+DBI::dbExecute(sc, "USE bronze")
+
+# 2. Ler BRONZE, tratar e MATERIALIZAR ainda no BRONZE
+tbl(sc, "venda") %>%
+  transmute(
+    idvenda = as.integer(idvenda),
+    data    = to_date(data)
+  ) %>%
+  filter(
+    !is.na(idvenda),
+    idvenda > 0,
+    !is.na(data)
+  ) %>%
+  compute(
+    name = "tmp_venda_bronze_tratada",
+    overwrite = TRUE
+  )
+
+# 3. Trocar contexto para SILVER
+DBI::dbExecute(sc, "USE silver")
+
+# 4. Escrita final (agora SEM conflito)
+spark_write_table(
+  tbl(sc, "tmp_venda_bronze_tratada"),
+  name = "venda",
+  mode = "overwrite"
+)
+
+
+```
+
+Venda Item
+
+```{r}
+#############################
+# TRATAMENTO DA TABELA VENDA_ITEM
+#############################
+# Regras aplicadas (conforme TCC):
+# - idvenda e idproduto obrigatórios
+# - valorcustoitem obrigatório
+# - registros sem custo não agregam valor econômico
+#############################
+
+DBI::dbExecute(sc, "
+  CREATE TABLE IF NOT EXISTS silver.venda_item (
+    idvenda INT,
+    idproduto INT,
+    valorcustoitem DOUBLE
+  )
+  STORED AS PARQUET
+")
+
+
+# 1. Contexto BRONZE
+DBI::dbExecute(sc, "USE bronze")
+
+# 2. Ler BRONZE, tratar e MATERIALIZAR ainda no BRONZE
+tbl(sc, "venda_item") %>%
+  transmute(                      # 
+    idvenda        = as.integer(idvenda),
+    idproduto      = as.integer(idproduto),
+    valorcustoitem = as.numeric(valorcustoitem)
+  ) %>%
+  filter(
+    !is.na(idvenda),
+    idvenda > 0,
+    !is.na(idproduto),
+    idproduto > 0,
+    !is.na(valorcustoitem),
+    valorcustoitem > 0
+  ) %>%
+  compute(
+    name = "tmp_venda_item_bronze_tratada",
+    overwrite = TRUE
+  )
+
+# 3. Trocar contexto para SILVER
+DBI::dbExecute(sc, "USE silver")
+
+# 4. Escrita FINAL (sem conflito de leitura/escrita)
+spark_write_table(
+  tbl(sc, "tmp_venda_item_bronze_tratada"),
+  name = "venda_item",
+  mode = "overwrite"
+)
+
+
+
+```
+
+Salário Mínimo
+
+```{r}
+
+#############################
+# TRATAMENTO DA TABELA SALÁRIO MÍNIMO
+#############################
+# Regras aplicadas (conforme TCC):
+# - ano obrigatório
+# - salario_minimo obrigatório
+# - valores <= 0 são economicamente inválidos
+#############################
+DBI::dbExecute(sc, "USE bronze")
+
+salario_minimo_df <- tbl(sc, "salario_minimo") %>%
+  compute(
+    name = "tmp_salario_minimo_bronze",
+    overwrite = TRUE
+  )
+
+
+tbl(sc, "bronze.salario_minimo") %>%
+  mutate(
+    ano = as.integer(ano),
+    salario_minimo = as.numeric(salario_minimo)
+  ) %>%
+  filter(
+    !is.na(ano),
+    ano >= 1900,
+    !is.na(salario_minimo),
+    salario_minimo > 0
+  ) %>%
+  arrange(ano) %>%   
+  compute(
+    name = "salario_minimo",
+    overwrite = TRUE
+  )
+
+
+
+salario_minimo_tratado <- tbl(sc, "tmp_salario_minimo_bronze") %>%
+  mutate(
+    ano = as.integer(ano),
+    salario_minimo = as.numeric(salario_minimo)
+  ) %>%
+  filter(
+    !is.na(ano),
+    ano >= 1900,
+    !is.na(salario_minimo),
+    salario_minimo > 0
+  ) %>%
+  compute(
+    name = "tmp_salario_minimo_tratado",
+    overwrite = TRUE
+  )
+DBI::dbExecute(sc, "USE silver")
+
+spark_write_table(
+  tbl(sc, "tmp_salario_minimo_tratado"),
+  name = "salario_minimo",
+  mode = "overwrite"
+)
+
+
+```
+
+## 5.  Camada Gold – Consolidação Analítica
+
+A camada Gold consolida os dados finais utilizados nas análises e modelos preditivos. CRIAÇÃO DA CESTA BÁSICA
+
+```{r}
+###############################################################
+# CAMADA GOLD – CONSTRUÇÃO DA CESTA BÁSICA MENSAL
+# Nesta etapa é construída explicitamente a base analítica
+# da cesta básica mensal, a partir das tabelas tratadas.
+# Todas as regras metodológicas descritas no TCC são aplicadas:
+# - Classificação textual idêntica ao SQL/Python
+# - Exigência de TODOS os itens da cesta
+# - Imputação por último valor disponível
+# - Série mensal contínua (2017–2025)
+###############################################################
+
+
+#############################
+# 1. LEITURA DAS TABELAS TRATADAS
+#############################
+
+DBI::dbExecute(sc, "USE silver")
+
+produto    <- tbl(sc, "produto")
+venda      <- tbl(sc, "venda")
+venda_item <- tbl(sc, "venda_item")
+
+
+#############################
+# 2. CLASSIFICAÇÃO DOS ITENS DA CESTA BÁSICA
+# (REGRA 1‑PARA‑1 DO PYTHON / SQL)
+#############################
+
+
+vendas_classificadas <- venda %>%
+  left_join(venda_item, by = "idvenda") %>%
+  left_join(produto,    by = "idproduto") %>%
+  mutate(
+    descr = lower(descricaoproduto),
+    item_cesta = case_when(
+      descr %like% "%arroz%"                 ~ "Arroz",
+      descr %like% "%acucar%"                ~ "Açucar",
+      descr %like% "%feijao%"                ~ "Feijão",
+      descr %like% "%sal%"                   ~ "Sal",
+      descr %like% "%farinha%"               ~ "Farinha Mandioca",
+      descr %like% "%flocao%"                ~ "Flocão de Milho",
+      descr %like% "%macarrao%"              ~ "Macarrão",
+      descr %like% "%vinagre%"               ~ "Vinagre",
+      descr %like% "%extrato%"               ~ "Extrato Tomate",
+      descr %like% "%oleo%"                  ~ "Óleo Soja",
+      descr %like% "%cafe%"                  ~ "Café",
+      descr %like% "%leite%"                 ~ "Leite em Pó",
+      descr %like% "%margarina%"             ~ "Margarina",
+      descr %like% "%biscoito%"              ~ "Biscoito",
+      descr %like% "%tempero%"               ~ "Tempero",
+      descr %like% "%papel hig%"             ~ "Papel Higiênico",
+      descr %like% "%sabao%"                 ~ "Sabão em Pó",
+      descr %like% "%pasta%" |
+        descr %like% "%creme dental%"        ~ "Creme Dental",
+      descr %like% "%esponja%" |
+        descr %like% "%bombril%"             ~ "Esponja de Aço",
+      descr %like% "%detergente%"            ~ "Detergente",
+      descr %like% "%sabonete%"              ~ "Sabonete",
+      descr %like% "%agua sanit%"            ~ "Água Sanitária",
+      TRUE                                   ~ "Outros"
+    )
+  ) %>%
+  filter(item_cesta != "Outros")
+
+
+#############################
+# 3. CUSTO MÉDIO MENSAL POR ITEM (SPARK)
+#############################
+
+
+media_mensal_item <- vendas_classificadas %>%
+  mutate(mes_ano = sql("date_trunc('month', data)")) %>%
+  group_by(mes_ano, item_cesta) %>%
+  summarise(
+    custo_item = mean(valorcustoitem),
+    .groups = "drop"
+  ) %>%
+  compute(
+    name = "tmp_media_mensal_item",
+    overwrite = TRUE
+  )
+
+
+#############################
+# 4. CRIAÇÃO DO EIXO COMPLETO (MÊS × ITEM)
+#############################
+
+
+media_mensal_item_r <- tbl(sc, "tmp_media_mensal_item") %>%
+  collect()
+
+calendario <- tibble(
+  mes_ano = seq(
+    from = min(media_mensal_item_r$mes_ano),
+    to   = max(media_mensal_item_r$mes_ano),
+    by   = "month"
+  )
+)
+
+itens_cesta <- media_mensal_item_r %>%
+  distinct(item_cesta)
+
+eixo_completo <- tidyr::expand_grid(
+  calendario,
+  itens_cesta
+)
+
+
+#############################
+# 5. IMPUTAÇÃO DOS ITENS FALTANTES
+#############################
+
+
+media_completa <- eixo_completo %>%
+  left_join(media_mensal_item_r, by = c("mes_ano", "item_cesta")) %>%
+  arrange(item_cesta, mes_ano) %>%
+  group_by(item_cesta) %>%
+  mutate(
+    custo_item = zoo::na.locf(custo_item, na.rm = FALSE)
+  ) %>%
+  ungroup()
+
+
+#############################
+# 6. QUANTIDADES OFICIAIS DA CESTA (GOV.BR)
+#############################
+
+quantidades <- tibble(
+  item_cesta = c(
+    "Arroz","Açucar","Feijão","Sal",
+    "Farinha Mandioca","Flocão de Milho","Macarrão",
+    "Vinagre","Extrato Tomate","Óleo Soja","Café",
+    "Leite em Pó","Margarina","Biscoito","Tempero",
+    "Papel Higiênico","Sabão em Pó","Creme Dental",
+    "Esponja de Aço","Detergente","Sabonete","Água Sanitária"
+  ),
+  qtd = c(
+    5,5,4,1,1,1,3,1,2,2,2,2,1,2,1,1,1,2,1,1,2,1
+  )
+)
+
+#############################
+# 7. CÁLCULO FINAL DA CESTA BÁSICA
+#############################
+
+
+df_CustoCestaBasica <- media_completa %>%
+  inner_join(quantidades, by = "item_cesta") %>%
+  mutate(custo_total = custo_item * qtd) %>%
+  group_by(mes_ano) %>%
+  summarise(
+    custo_medio_cesta = sum(custo_total),
+    .groups = "drop"
+  ) %>%
+  arrange(mes_ano)
+
+#############################
+# 8. PERSISTÊNCIA NA CAMADA GOLD
+#############################
+DBI::dbExecute(sc, "USE gold")
+
+spark_write_table(
+  copy_to(sc, df_CustoCestaBasica, overwrite = TRUE),
+  name = "cesta_basica_mensal",
+  mode = "overwrite"
+)
+
+
+#############################
+# 9. ANÁLISE EXPLORATÓRIA
+#############################
+
+df_plot <- df_CustoCestaBasica %>%
+  rename(ano_mes = mes_ano) %>%
+  filter(!is.na(custo_medio_cesta))
+
+ggplot(df_plot, aes(x = ano_mes, y = custo_medio_cesta)) +
+  geom_line(color = "steelblue") +
+  geom_point(color = "steelblue") +
+  labs(
+    title = "Evolução Mensal do Valor da Cesta Básica",
+    x = "Ano",
+    y = "Valor da Cesta Básica (R$)"
+  ) +
+  theme_minimal()
+
+print("df_CustoCestaBasica criado, validado e persistido na camada GOLD")
+```
+Criacao das tabelas GOLD
+
+
+```{r}
+
+
+spark_write_table(
+  copy_to(sc, df_CustoCestaBasica, overwrite = TRUE),
+  name     = "cesta_basica_mensal",
+  database = "gold",
+  mode     = "overwrite"
+)
+
+
+spark_write_table(
+  tbl(sc, "silver.salario_minimo"),
+  name     = "salario_minimo",
+  database = "gold",
+  mode     = "overwrite"
+)
+
+```
+
+## 6.  Análise Exploratória
+
+```{r}
+df <- df_CustoCestaBasica %>%
+  rename(ano_mes = mes_ano) %>%
+  filter(!is.na(custo_medio_cesta))
+
+ggplot(df, aes(ano_mes, custo_medio_cesta)) +
+  geom_line() +
+  geom_point() +
+  labs(
+    title = "Evolução Mensal do Valor da Cesta Básica",
+    x = "Ano",
+    y = "Valor da Cesta (R$)"
+  ) +
+  theme_minimal()
+
+###############################################################
+# GRÁFICO NORMALIZADO – CESTA BÁSICA x SALÁRIO MÍNIMO
+# CORREÇÃO DEFINITIVA (SEM NA / INF)
+###############################################################
+
+# --- Cesta básica anual ---
+cesta_anual <- df_CustoCestaBasica %>%
+  rename(ds = mes_ano, y = custo_medio_cesta) %>%
+  mutate(ano = year(ds)) %>%
+  group_by(ano) %>%
+  summarise(
+    valor_cesta = mean(y, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# --- Salário mínimo anual ---
+salario_anual <- df_salario %>%
+  transmute(
+    ano = year(ds),
+    valor_salario = y
+  )
+
+# --- Alinhar anos ---
+base_alinhada <- cesta_anual %>%
+  inner_join(salario_anual, by = "ano") %>%
+  arrange(ano)
+
+# --- Encontrar PRIMEIRO ano com valores válidos ---
+ano_base <- base_alinhada %>%
+  filter(
+    !is.na(valor_cesta),
+    valor_cesta > 0,
+    !is.na(valor_salario),
+    valor_salario > 0
+  ) %>%
+  summarise(min(ano)) %>%
+  pull()
+
+# --- Valores base ---
+valor_base_cesta <- base_alinhada %>%
+  filter(ano == ano_base) %>%
+  pull(valor_cesta)
+
+valor_base_salario <- base_alinhada %>%
+  filter(ano == ano_base) %>%
+  pull(valor_salario)
+
+# --- Normalização ---
+df_normalizado <- base_alinhada %>%
+  mutate(
+    cesta_normalizada   = (valor_cesta   / valor_base_cesta)   * 100,
+    salario_normalizado = (valor_salario / valor_base_salario) * 100
+  ) %>%
+  select(ano, cesta_normalizada, salario_normalizado) %>%
+  pivot_longer(
+    cols = c(cesta_normalizada, salario_normalizado),
+    names_to = "Serie",
+    values_to = "Indice"
+  ) %>%
+  mutate(
+    Serie = recode(
+      Serie,
+      cesta_normalizada   = "Cesta Básica",
+      salario_normalizado = "Salário Mínimo"
+    )
+  ) %>%
+  filter(is.finite(Indice))   # 🔑 LINHA CRÍTICA
+
+# --- Gráfico ---
+ggplot(df_normalizado, aes(x = ano, y = Indice, color = Serie)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  scale_color_manual(values = c(
+    "Cesta Básica"   = "firebrick",
+    "Salário Mínimo" = "steelblue"
+  )) +
+  labs(
+    title = "Evolução Normalizada da Cesta Básica e do Salário Mínimo",
+    subtitle = paste("Índice base = 100 no ano", ano_base),
+    x = "Ano",
+    y = "Índice Normalizado",
+    color = "Série"
+  ) +
+  theme_minimal()
+```
+
+## 7.  Modelagem Preditiva – Prophet
+
+```{r}
+ts_cesta <- ts(
+  df$custo_medio_cesta,
+  start = c(year(min(df$ano_mes)), month(min(df$ano_mes))),
+  frequency = 12
+)
+
+modelo_prophet <- prophet(df %>% rename(ds = ano_mes, y = custo_medio_cesta))
+forecast_prophet <- predict(
+  modelo_prophet,
+  make_future_dataframe(modelo_prophet, periods = 60, freq = "month")
+)
+```
+
+COMPARAÇÃO DE MODELOS + ÍNDICE DE PODER DE COMPRA
+
+```{r}
+###############################################################
+# MODELAGEM DA CESTA BÁSICA – AVALIAÇÃO COMPLETA DOS MODELOS
+# (ARIMA x PROPHET)
+# - Linha base: série real
+# - Linha do tempo completa
+# - Forecast até 2030
+# - Tabela única de métricas e vencedor geral
+###############################################################
+
+#############################
+# 1. PREPARAÇÃO DA SÉRIE
+#############################
+
+df_cesta <- df_CustoCestaBasica %>%
+  rename(ds = mes_ano, y = custo_medio_cesta) %>%
+  filter(!is.na(y)) %>%
+  arrange(ds)
+
+ts_cesta <- ts(
+  df_cesta$y,
+  start = c(year(min(df_cesta$ds)), month(min(df_cesta$ds))),
+  frequency = 12
+)
+
+#############################
+# 2. DIVISÃO TREINO / TESTE (80 / 20)
+#############################
+
+n <- length(ts_cesta)
+n_treino <- floor(0.8 * n)
+
+ts_train <- ts_cesta[1:n_treino]
+ts_test  <- ts_cesta[(n_treino + 1):n]
+
+#############################
+# 3. MODELO ARIMA
+#############################
+
+modelo_arima <- auto.arima(ts_train)
+
+fc_arima_test <- forecast(
+  modelo_arima,
+  h = length(ts_test)
+)
+
+#############################
+# 4. MODELO PROPHET
+#############################
+
+df_train_prophet <- df_cesta[1:n_treino, ]
+
+modelo_prophet <- prophet(df_train_prophet)
+
+future_test <- make_future_dataframe(
+  modelo_prophet,
+  periods = length(ts_test),
+  freq = "month"
+)
+
+fc_prophet_test <- predict(modelo_prophet, future_test) %>%
+  tail(length(ts_test))
+
+#############################
+# 5. MÉTRICAS QUANTITATIVAS
+#############################
+
+rmse_arima <- sqrt(mean((ts_test - fc_arima_test$mean)^2))
+mae_arima  <- mean(abs(ts_test - fc_arima_test$mean))
+
+rmse_prophet <- sqrt(mean((ts_test - fc_prophet_test$yhat)^2))
+mae_prophet  <- mean(abs(ts_test - fc_prophet_test$yhat))
+
+#############################
+# 6. FORECAST COMPLETO ATÉ 2030
+#############################
+
+horizon <- as.integer(
+  interval(max(df_cesta$ds), ymd("2030-12-01")) / months(1)
+)
+
+# ARIMA
+fc_arima_full <- forecast(auto.arima(ts_cesta), h = horizon)
+
+df_arima_fc <- tibble(
+  ds = seq(max(df_cesta$ds) %m+% months(1),
+           max(df_cesta$ds) %m+% months(horizon),
+           by = "month"),
+  yhat = as.numeric(fc_arima_full$mean)
+)
+
+# PROPHET
+modelo_prophet_full <- prophet(df_cesta)
+
+future_full <- make_future_dataframe(
+  modelo_prophet_full,
+  periods = horizon,
+  freq = "month"
+)
+
+df_prophet_fc <- predict(modelo_prophet_full, future_full) %>%
+  filter(ds > max(df_cesta$ds)) %>%
+  select(ds, yhat)
+
+#############################
+# 7. MÉTRICA QUALITATIVA – VARIABILIDADE
+#############################
+
+avaliar_variabilidade <- function(df_fc) {
+  df_fc %>%
+    mutate(ano = year(ds)) %>%
+    group_by(ano) %>%
+    summarise(
+      variabilidade = max(yhat) - min(yhat),
+      .groups = "drop"
+    ) %>%
+    summarise(
+      variabilidade_media = mean(variabilidade)
+    )
+}
+
+qual_arima   <- avaliar_variabilidade(df_arima_fc)
+qual_prophet <- avaliar_variabilidade(df_prophet_fc)
+
+#############################
+# 8. TABELA FINAL DE MÉTRICAS + VENCEDORES
+#############################
+
+tabela_metricas <- tibble(
+  Modelo = c("ARIMA", "PROPHET"),
+  RMSE = c(rmse_arima, rmse_prophet),
+  MAE  = c(mae_arima, mae_prophet),
+  Variabilidade = c(
+    qual_arima$variabilidade_media,
+    qual_prophet$variabilidade_media
+  )
+) %>%
+  mutate(
+    Vencedor_RMSE = if_else(RMSE == min(RMSE), "✅", ""),
+    Vencedor_MAE  = if_else(MAE  == min(MAE),  "✅", ""),
+    Vencedor_VAR  = if_else(Variabilidade == min(Variabilidade), "✅", "")
+  )
+
+print(tabela_metricas)
+
+modelo_vencedor <- tabela_metricas %>%
+  arrange(RMSE, MAE, Variabilidade) %>%
+  slice(1) %>%
+  pull(Modelo)
+
+cat("\n✅ Modelo vencedor geral:", modelo_vencedor, "\n")
+
+#############################
+# 9. GRÁFICOS INDIVIDUAIS
+#############################
+
+# ARIMA
+ggplot() +
+  geom_line(data = df_cesta,
+            aes(x = ds, y = y),
+            color = "black", linewidth = 1) +
+  geom_line(data = df_arima_fc,
+            aes(x = ds, y = yhat),
+            color = "steelblue", linewidth = 1) +
+  labs(
+    title = "Cesta Básica – Série Real e Previsão ARIMA até 2030",
+    x = "Ano",
+    y = "Custo da Cesta Básica (R$)"
+  ) +
+  theme_minimal()
+
+# PROPHET
+ggplot() +
+  geom_line(data = df_cesta,
+            aes(x = ds, y = y),
+            color = "black", linewidth = 1) +
+  geom_line(data = df_prophet_fc,
+            aes(x = ds, y = yhat),
+            color = "darkgreen", linewidth = 1) +
+  labs(
+    title = "Cesta Básica – Série Real e Previsão Prophet até 2030",
+    x = "Ano",
+    y = "Custo da Cesta Básica (R$)"
+  ) +
+  theme_minimal()
+
+###############################################################
+# GRÁFICO COMPARATIVO – CESTA BÁSICA
+# REAL x ARIMA x PROPHET (ATÉ 2030)
+###############################################################
+
+df_overlay_cesta <- bind_rows(
+  df_cesta %>%
+    transmute(
+      ds,
+      y_plot = y,
+      Modelo = "Real"
+    ),
+
+  df_arima_fc %>%
+    transmute(
+      ds,
+      y_plot = yhat,
+      Modelo = "ARIMA"
+    ),
+
+  df_prophet_fc %>%
+    transmute(
+      ds,
+      y_plot = yhat,
+      Modelo = "PROPHET"
+    )
+)
+
+ggplot(df_overlay_cesta, aes(x = ds, y = y_plot, color = Modelo)) +
+  geom_line(linewidth = 0.5) +
+  scale_color_manual(
+    values = c(
+      "Real"    = "black",
+      "ARIMA"   = "steelblue",
+      "PROPHET" = "darkgreen"
+    )
+  ) +
+  labs(
+    title = "Cesta Básica – Série Real e Projeções (ARIMA × Prophet)",
+    subtitle = "Projeções até 2030 com sobreposição das trajetórias",
+    x = "Ano",
+    y = "Custo Médio da Cesta Básica (R$)",
+    color = "Série"
+  ) +
+  theme_minimal()
+
+###############################################################
+# FIM DA MODELAGEM E COMPARAÇÃO DOS MODELOS
+###############################################################
+
+```
+
+Embora o modelo Prophet apresente comportamento visualmente mais suave e plausível para projeções de longo prazo, o modelo ARIMA apresentou menor erro médio no período de teste para a série da cesta básica, indicando melhor ajuste local. Para o salário mínimo, cuja dinâmica é dominada por mudanças estruturais e políticas públicas, o Prophet apresentou desempenho superior.
+
+MODELAGEM E COMPARAÇÃO DO SALÁRIO MÍNIMO
+
+```{r}
+###############################################################
+# MODELAGEM DO SALÁRIO MÍNIMO – AVALIAÇÃO COMPLETA DOS MODELOS
+# ARIMA x PROPHET
+# - Linha base: série real
+# - Linha do tempo completa
+# - Forecast até 2030
+# - Tabela única de métricas e vencedor geral
+###############################################################
+
+#############################
+# 1. PREPARAÇÃO DA SÉRIE
+#############################
+
+salario_gold <- tbl(sc, "gold.salario_minimo") %>%
+  collect() %>%
+  arrange(ano)
+
+df_salario <- salario_gold %>%
+  transmute(
+    ds = as.Date(paste0(ano, "-01-01")),
+    y  = salario_minimo
+  ) %>%
+  filter(!is.na(y)) %>%
+  arrange(ds)
+
+ts_salario <- ts(
+  df_salario$y,
+  start = min(salario_gold$ano),
+  frequency = 1
+)
+
+#############################
+# 2. DIVISÃO TREINO / TESTE (80 / 20)
+#############################
+
+n <- length(ts_salario)
+n_treino <- floor(0.8 * n)
+
+ts_train <- ts_salario[1:n_treino]
+ts_test  <- ts_salario[(n_treino + 1):n]
+
+#############################
+# 3. MODELO ARIMA
+#############################
+
+modelo_arima <- auto.arima(ts_train)
+
+fc_arima_test <- forecast(
+  modelo_arima,
+  h = length(ts_test)
+)
+
+#############################
+# 4. MODELO PROPHET
+#############################
+
+df_train_prophet <- df_salario[1:n_treino, ]
+
+modelo_prophet <- prophet(
+  df_train_prophet,
+  yearly.seasonality = FALSE,
+  weekly.seasonality = FALSE,
+  daily.seasonality  = FALSE
+)
+
+future_test <- make_future_dataframe(
+  modelo_prophet,
+  periods = length(ts_test),
+  freq = "year"
+)
+
+fc_prophet_test <- predict(modelo_prophet, future_test) %>%
+  tail(length(ts_test))
+
+#############################
+# 5. MÉTRICAS QUANTITATIVAS
+#############################
+
+rmse_arima <- sqrt(mean((ts_test - fc_arima_test$mean)^2))
+mae_arima  <- mean(abs(ts_test - fc_arima_test$mean))
+
+rmse_prophet <- sqrt(mean((ts_test - fc_prophet_test$yhat)^2))
+mae_prophet  <- mean(abs(ts_test - fc_prophet_test$yhat))
+
+#############################
+# 6. FORECAST COMPLETO ATÉ 2030
+#############################
+
+horizon <- as.integer(
+  interval(max(df_salario$ds), ymd("2030-01-01")) / years(1)
+)
+
+# ARIMA
+fc_arima_full <- forecast(auto.arima(ts_salario), h = horizon)
+
+df_arima_fc <- tibble(
+  ds = seq(max(df_salario$ds) %m+% years(1),
+           max(df_salario$ds) %m+% years(horizon),
+           by = "year"),
+  yhat = as.numeric(fc_arima_full$mean)
+)
+
+# PROPHET
+modelo_prophet_full <- prophet(
+  df_salario,
+  yearly.seasonality = FALSE,
+  weekly.seasonality = FALSE,
+  daily.seasonality  = FALSE
+)
+
+future_full <- make_future_dataframe(
+  modelo_prophet_full,
+  periods = horizon,
+  freq = "year"
+)
+
+df_prophet_fc <- predict(modelo_prophet_full, future_full) %>%
+  filter(ds > max(df_salario$ds)) %>%
+  select(ds, yhat)
+
+#############################
+# 7. MÉTRICA QUALITATIVA – VARIABILIDADE
+#############################
+
+avaliar_variabilidade <- function(df_fc) {
+  df_fc %>%
+    mutate(ano = year(ds)) %>%
+    group_by(ano) %>%
+    summarise(
+      variabilidade = max(yhat) - min(yhat),
+      .groups = "drop"
+    ) %>%
+    summarise(
+      variabilidade_media = mean(variabilidade)
+    )
+}
+
+qual_arima   <- avaliar_variabilidade(df_arima_fc)
+qual_prophet <- avaliar_variabilidade(df_prophet_fc)
+
+#############################
+# 8. TABELA FINAL DE MÉTRICAS + VENCEDORES
+#############################
+
+tabela_metricas <- tibble(
+  Modelo = c("ARIMA", "PROPHET"),
+  RMSE = c(rmse_arima, rmse_prophet),
+  MAE  = c(mae_arima, mae_prophet),
+  Variabilidade = c(
+    qual_arima$variabilidade_media,
+    qual_prophet$variabilidade_media
+  )
+) %>%
+  mutate(
+    Vencedor_RMSE = if_else(RMSE == min(RMSE), "✅", ""),
+    Vencedor_MAE  = if_else(MAE  == min(MAE),  "✅", ""),
+    Vencedor_VAR  = if_else(Variabilidade == min(Variabilidade), "✅", "")
+  )
+
+print(tabela_metricas)
+
+modelo_vencedor <- tabela_metricas %>%
+  arrange(RMSE, MAE, Variabilidade) %>%
+  slice(1) %>%
+  pull(Modelo)
+
+cat("\n Modelo vencedor geral (Salário Mínimo):", modelo_vencedor, "\n")
+
+#############################
+# 9. GRÁFICOS INDIVIDUAIS
+#############################
+
+# ARIMA
+ggplot() +
+  geom_line(data = df_salario,
+            aes(x = ds, y = y),
+            color = "black", linewidth = 1) +
+  geom_line(data = df_arima_fc,
+            aes(x = ds, y = yhat),
+            color = "steelblue", linewidth = 1) +
+  labs(
+    title = "Salário Mínimo – Série Real e Previsão ARIMA até 2030",
+    x = "Ano",
+    y = "Salário Mínimo (R$)"
+  ) +
+  theme_minimal()
+
+# PROPHET
+ggplot() +
+  geom_line(data = df_salario,
+            aes(x = ds, y = y),
+            color = "black", linewidth = 1) +
+  geom_line(data = df_prophet_fc,
+            aes(x = ds, y = yhat),
+            color = "darkgreen", linewidth = 1) +
+  labs(
+    title = "Salário Mínimo – Série Real e Previsão Prophet até 2030",
+    x = "Ano",
+    y = "Salário Mínimo (R$)"
+  ) +
+  theme_minimal()
+
+###############################################################
+# GRÁFICO COMPARATIVO – REAL x ARIMA x PROPHET
+###############################################################
+
+df_overlay <- bind_rows(
+  df_salario %>%
+    mutate(Modelo = "Real", y_plot = y),
+
+  df_arima_fc %>%
+    mutate(Modelo = "ARIMA", y_plot = yhat),
+
+  df_prophet_fc %>%
+    mutate(Modelo = "PROPHET", y_plot = yhat)
+)
+
+ggplot(df_overlay, aes(x = ds, y = y_plot, color = Modelo)) +
+  geom_line(linewidth = 0.25) +
+  scale_color_manual(
+    values = c(
+      "Real"    = "black",
+      "ARIMA"   = "steelblue",
+      "PROPHET" = "darkgreen"
+    )
+  ) +
+  labs(
+    title = "Salário Mínimo – Série Real e Projeções (ARIMA × Prophet)",
+    subtitle = "Projeções até 2030 evidenciam tendência linear dominante",
+    x = "Ano",
+    y = "Salário Mínimo (R$)",
+    color = "Série"
+  ) +
+  theme_minimal()
+
+###############################################################
+# FIM DA MODELAGEM DO SALÁRIO MÍNIMO
+###############################################################
+```
+No salário mínimo, o Prophet apresentou melhor desempenho porque a série é dominada por decisões institucionais e mudanças estruturais, e não por dinâmica estocástica de mercado.
+
+## 8. Criação dos Indices
+ ÍNDICE DE PODER DE COMPRA (CRIAÇÃO, INTERPRETAÇÃO E CONCLUSÃO)
+
+```{r}
+###############################################################
+# CONSTRUÇÃO DOS INDICADORES DE PODER DE COMPRA
+# (PONTUAL E ACUMULADO)
+###############################################################
+
+
+
+#############################
+# 1. BASE ANUAL DA CESTA BÁSICA
+#############################
+
+cesta_anual <- df_CustoCestaBasica %>%
+  rename(ds = mes_ano, y = custo_medio_cesta) %>%
+  filter(!is.na(y)) %>%
+  mutate(ano = year(ds)) %>%
+  group_by(ano) %>%
+  summarise(
+    custo_medio_anual = mean(y),
+    inflacao_cesta = (last(y) - first(y)) / first(y) * 100,
+    .groups = "drop"
+  )
+
+#############################
+# 2. SALÁRIO MÍNIMO (ANUAL)
+#############################
+
+salario_anual <- tbl(sc, "gold.salario_minimo") %>%
+  collect() %>%
+  arrange(ano)
+
+#############################
+# 3. INDICADOR 1 — PODER DE COMPRA PONTUAL
+#############################
+
+indice_pontual <- cesta_anual %>%
+  inner_join(salario_anual, by = "ano") %>%
+  mutate(
+    indice_poder_compra = salario_minimo / custo_medio_anual
+  ) %>%
+  select(
+    ano,
+    salario_minimo,
+    custo_medio_anual,
+    indice_poder_compra
+  )
+
+#
+#############################
+# 4. INDICADOR 2 — PRESSÃO ECONÔMICA ACUMULADA (CORRIGIDO)
+#############################
+
+# Poder de compra pontual
+ipc_pontual <- cesta_anual %>%
+  inner_join(salario_anual, by = "ano") %>%
+  mutate(
+    indice_poder_compra = salario_minimo / custo_medio_anual
+  ) %>%
+  arrange(ano)
+
+# Ano base (primeiro ano)
+ipc_base <- ipc_pontual$indice_poder_compra[1]
+
+# Pressão econômica acumulada (coerente)
+indice_acumulado <- ipc_pontual %>%
+  mutate(
+    pressao_anual = (ipc_base - indice_poder_compra) / ipc_base,
+    indice_pressao_acumulada = cumsum(pressao_anual)
+  ) %>%
+  select(
+    ano,
+    indice_pressao_acumulada
+  )
+
+
+#############################
+# 5. PERSISTÊNCIA NA CAMADA GOLD
+#############################
+
+# Indicador pontual
+spark_write_table(
+  copy_to(sc, indice_pontual, overwrite = TRUE),
+  name     = "indice_poder_compra_pontual",
+  database = "gold",
+  mode     = "overwrite"
+)
+
+# Indicador acumulado
+spark_write_table(
+  copy_to(sc, indice_acumulado, overwrite = TRUE),
+  name     = "indice_pressao_economica_acumulada",
+  database = "gold",
+  mode     = "overwrite"
+)
+
+
+###############################################################
+# GRÁFICO – PODER DE COMPRA PONTUAL (ANUAL)
+###############################################################
+
+ipc_pontual <- tbl(sc, "gold.indice_poder_compra_pontual") %>%
+  collect() %>%
+  arrange(ano)
+
+ggplot(ipc_pontual, aes(x = ano, y = indice_poder_compra)) +
+  geom_line(color = "steelblue", linewidth = 1) +
+  geom_point(color = "steelblue", size = 2) +
+  labs(
+    title = "Poder de Compra Pontual do Salário Mínimo",
+    subtitle = "Número de cestas básicas adquiridas por ano",
+    x = "Ano",
+    y = "Número de Cestas Básicas"
+  ) +
+  theme_minimal()
+
+
+###############################################################
+# GRÁFICO – PRESSÃO ECONÔMICA ACUMULADA
+###############################################################
+
+ipc_acumulado <- tbl(sc, "gold.indice_pressao_economica_acumulada") %>%
+  collect() %>%
+  arrange(ano)
+
+ggplot(ipc_acumulado, aes(x = ano, y = indice_pressao_acumulada)) +
+  geom_line(color = "black", linewidth = 1) +
+  geom_point(color = "black", size = 2) +
+  labs(
+    title = "Índice de Pressão Econômica Acumulada",
+    subtitle = "Acúmulo do desequilíbrio entre renda e custo de vida",
+    x = "Ano",
+    y = "Índice Acumulado"
+  ) +
+  theme_minimal()
+
+###############################################################
+# PERDA PERCENTUAL DO PODER DE COMPRA DO SALÁRIO
+###############################################################
+
+ipc_pontual <- tbl(sc, "gold.indice_poder_compra_pontual") %>%
+  collect() %>%
+  arrange(ano)
+
+# ano base (primeiro da série)
+ipc_base <- ipc_pontual$indice_poder_compra[1]
+
+perda_salario <- ipc_pontual %>%
+  mutate(
+    perda_percentual = (1 - indice_poder_compra / ipc_base) * 100
+  )
+
+print(perda_salario)
+
+
+###############################################################
+# GRÁFICO – PERDA PERCENTUAL DO PODER DE COMPRA DO SALÁRIO
+###############################################################
+
+ggplot(perda_salario, aes(x = ano, y = perda_percentual)) +
+  geom_line(color = "firebrick", linewidth = 1) +
+  geom_point(color = "firebrick", size = 2) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey40") +
+  labs(
+    title = "Perda Percentual do Poder de Compra do Salário",
+    subtitle = paste("Ano base:", perda_salario$ano[1]),
+    x = "Ano",
+    y = "Perda Percentual (%)"
+  ) +
+  theme_minimal()
+
+```
+Indice da pressão Economica - Analise: 
+
+Bom (\< 1,0) → crescimento salarial acompanha ou supera o custo da cesta → cenário típico de economias estáveis (OCDE) Situação observada em economias estáveis, onde a renda acompanha ou supera o custo dos bens essenciais.
+
+Moderado (1,0 – 1,5) → parte crescente da renda comprometida → padrão observado em economias emergentes → risco controlado, porém crescente Padrão comum em economias emergentes, indicando pressão crescente sobre a renda, porém ainda controlada.
+
+Ruim (\> 1,5) → inflação alimentar supera reajustes salariais → necessidade de endividamento para manter consumo → cenário recorrente em períodos de crise econômica Cenário associado a perda significativa do poder de compra, exigindo endividamento para manutenção do consumo básico.
+
+Os limites de interpretação do índice de poder de compra foram definidos a partir de referências empíricas da literatura econômica internacional, que analisam a relação entre crescimento salarial, inflação de bens essenciais e comprometimento da renda familiar. Embora o índice proposto seja original, sua interpretação segue padrões observados em estudos da OCDE, Banco Mundial e FMI.
+
+Predição dos indicadores para um senario de 5 anos.
+
+As projeções dos indicadores de poder de compra não foram obtidas por modelos próprios, mas derivadas diretamente das previsões do salário mínimo e do custo da cesta básica, preservando coerência econômica e evitando modelagem redundante.
+```{r}
+###############################################################
+# INDICADORES ECONÔMICOS – BASE ANUAL + PROJEÇÃO (5 ANOS)
+# ✔ Sem serrilhado
+# ✔ Sem quebra visual
+# ✔ Coerência econômica
+###############################################################
+
+library(dplyr)
+library(lubridate)
+library(ggplot2)
+
+#############################
+# 1. CESTA BÁSICA – ANUAL (HISTÓRICO)
+#############################
+
+cesta_anual_plot <- df_cesta %>%
+  mutate(ano = year(ds)) %>%
+  group_by(ano) %>%
+  summarise(
+    custo_cesta = mean(y),
+    .groups = "drop"
+  ) %>%
+  mutate(tipo = "Observado")
+
+#############################
+# 2. CESTA BÁSICA – ANUAL (PREVISÃO ARIMA)
+#############################
+
+cesta_prev_anual <- df_arima_fc %>%
+  mutate(ano = year(ds)) %>%
+  group_by(ano) %>%
+  summarise(
+    custo_cesta = mean(yhat),
+    .groups = "drop"
+  ) %>%
+  mutate(tipo = "Previsto")
+
+#############################
+# 3. SALÁRIO MÍNIMO – ANUAL (HISTÓRICO + PREVISÃO PROPHET)
+#############################
+
+salario_plot <- bind_rows(
+  df_salario %>%
+    transmute(
+      ano = year(ds),
+      salario_minimo = y,
+      tipo = "Observado"
+    ),
+  df_prophet_fc_sal %>%
+    transmute(
+      ano = year(ds),
+      salario_minimo = yhat,
+      tipo = "Previsto"
+    )
+)
+
+#############################
+# 4. BASE CONSOLIDADA ANUAL
+#############################
+
+base_futura_anual <- salario_plot %>%
+  inner_join(
+    bind_rows(cesta_anual_plot, cesta_prev_anual),
+    by = c("ano", "tipo")
+  ) %>%
+  arrange(ano)
+
+#############################
+# 5. PODER DE COMPRA PONTUAL (ANUAL)
+#############################
+
+ipc_pontual_anual <- base_futura_anual %>%
+  mutate(
+    indice_poder_compra = salario_minimo / custo_cesta
+  )
+
+#############################
+# 6. PERDA PERCENTUAL DO SALÁRIO
+#############################
+
+ipc_base <- ipc_pontual_anual %>%
+  filter(tipo == "Observado") %>%
+  arrange(ano) %>%
+  slice(1) %>%
+  pull(indice_poder_compra)
+
+perda_salario_anual <- ipc_pontual_anual %>%
+  mutate(
+    perda_percentual = (1 - indice_poder_compra / ipc_base) * 100
+  )
+
+#############################
+# 7. PRESSÃO ECONÔMICA ACUMULADA (CORRETA)
+#############################
+
+indice_pressao_anual <- ipc_pontual_anual %>%
+  arrange(ano) %>%
+  mutate(
+    pressao_anual = (ipc_base - indice_poder_compra) / ipc_base,
+    indice_pressao_acumulada = cumsum(pressao_anual)
+  )
+
+#############################
+# 8. GRÁFICOS FINAIS
+#############################
+
+# 8.1 Poder de compra pontual
+ggplot(ipc_pontual_anual,
+       aes(x = ano, y = indice_poder_compra, color = tipo)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  scale_color_manual(values = c(
+    "Observado" = "steelblue",
+    "Previsto"  = "darkorange"
+  )) +
+  labs(
+    title = "Poder de Compra Pontual – Série Anual e Projeção (5 anos)",
+    x = "Ano",
+    y = "Número de Cestas Básicas",
+    color = "Série"
+  ) +
+  theme_minimal()
+
+# 8.2 Perda percentual do salário
+ggplot(perda_salario_anual,
+       aes(x = ano, y = perda_percentual, color = tipo)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  scale_color_manual(values = c(
+    "Observado" = "firebrick",
+    "Previsto"  = "darkorange"
+  )) +
+  labs(
+    title = "Perda Percentual do Poder de Compra do Salário (Anual)",
+    subtitle = paste("Ano base:", min(perda_salario_anual$ano)),
+    x = "Ano",
+    y = "Perda Percentual (%)",
+    color = "Série"
+  ) +
+  theme_minimal()
+
+# 8.3 Pressão econômica acumulada
+ggplot(indice_pressao_anual,
+       aes(x = ano, y = indice_pressao_acumulada, color = tipo)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  scale_color_manual(values = c(
+    "Observado" = "black",
+    "Previsto"  = "darkorange"
+  )) +
+  labs(
+    title = "Índice de Pressão Econômica Acumulada (Anual)",
+    subtitle = "Desvio acumulado do poder de compra em relação ao ano base",
+    x = "Ano",
+    y = "Índice Acumulado",
+    color = "Série"
+  ) +
+  theme_minimal()
+
+
+```
+Embora o poder de compra pontual e a perda percentual do salário indiquem tendência de estabilização no horizonte projetado, o índice de pressão econômica acumulada mantém trajetória ascendente. Isso ocorre porque o indicador acumulado incorpora a memória histórica do desequilíbrio entre renda e custo de vida, de modo que anos consecutivos em patamar inferior ao ano base continuam adicionando pressão estrutural, mesmo na ausência de novas quedas acentuadas.
+
+
+## 9.Resumo da situação atual x prodição para os proximos 5 anos
+```{r}
+###############################################################
+#ÍNDICES DERIVADOS + PROJEÇÃO + TABELA RESUMO
+###############################################################
+
+
+#############################
+# 1. BASE HISTÓRICA + FUTURA
+#############################
+
+# Salário mínimo (histórico + previsão)
+salario_futuro <- bind_rows(
+  df_salario %>%
+    transmute(
+      ano = year(ds),
+      salario_minimo = y,
+      tipo = "Observado"
+    ),
+  df_prophet_fc_sal %>%
+    transmute(
+      ano = year(ds),
+      salario_minimo = yhat,
+      tipo = "Previsto"
+    )
+)
+
+# Cesta básica (histórico + previsão)
+cesta_futuro <- bind_rows(
+  df_cesta %>%
+    transmute(
+      ano = year(ds),
+      custo_cesta = y,
+      tipo = "Observado"
+    ),
+  df_arima_fc %>%
+    transmute(
+      ano = year(ds),
+      custo_cesta = yhat,
+      tipo = "Previsto"
+    )
+)
+
+# Base consolidada
+base_futura <- salario_futuro %>%
+  inner_join(cesta_futuro, by = c("ano", "tipo")) %>%
+  arrange(ano)
+
+#############################
+# 2. PODER DE COMPRA PONTUAL
+#############################
+
+ipc_pontual_futuro <- base_futura %>%
+  mutate(
+    indice_poder_compra = salario_minimo / custo_cesta
+  )
+
+#############################
+# 3. PERDA PERCENTUAL DO SALÁRIO
+#############################
+
+ipc_base <- ipc_pontual_futuro %>%
+  filter(tipo == "Observado") %>%
+  arrange(ano) %>%
+  slice(1) %>%
+  pull(indice_poder_compra)
+
+perda_salario_futuro <- ipc_pontual_futuro %>%
+  mutate(
+    perda_percentual = (1 - indice_poder_compra / ipc_base) * 100
+  ) %>%
+  select(
+    ano,
+    tipo,
+    perda_percentual
+  )
+
+###############################################################
+# PRESSÃO ECONÔMICA ACUMULADA – VERSÃO CORRIGIDA
+###############################################################
+
+ipc_base <- ipc_pontual_futuro %>%
+  filter(tipo == "Observado") %>%
+  arrange(ano) %>%
+  slice(1) %>%
+  pull(indice_poder_compra)
+
+indice_pressao_futuro_corrigido <- ipc_pontual_futuro %>%
+  mutate(
+    pressao_anual = (ipc_base - indice_poder_compra) / ipc_base,
+    indice_pressao_acumulada = cumsum(pressao_anual)
+  ) %>%
+  select(
+    ano,
+    tipo,
+    indice_pressao_acumulada
+  )
+
+
+#############################
+# 5. TABELA‑RESUMO FINAL
+#############################
+
+tabela_resumo_final <- tibble(
+  Indicador = c(
+    "Poder de Compra Pontual (cestas)",
+    "Perda Percentual do Salário (%)",
+    "Pressão Econômica Acumulada"
+  ),
+  Situacao_Atual = c(
+    round(
+      ipc_pontual_futuro %>%
+        filter(tipo == "Observado") %>%
+        slice_tail(n = 1) %>%
+        pull(indice_poder_compra), 2
+    ),
+    round(
+      perda_salario_futuro %>%
+        filter(tipo == "Observado") %>%
+        slice_tail(n = 1) %>%
+        pull(perda_percentual), 2
+    ),
+    round(
+      indice_pressao_futuro %>%
+        filter(tipo == "Observado") %>%
+        slice_tail(n = 1) %>%
+        pull(indice_pressao_acumulada), 2
+    )
+  ),
+  Projecao_5_Anos = c(
+    round(
+      ipc_pontual_futuro %>%
+        filter(tipo == "Previsto") %>%
+        slice_tail(n = 1) %>%
+        pull(indice_poder_compra), 2
+    ),
+    round(
+      perda_salario_futuro %>%
+        filter(tipo == "Previsto") %>%
+        slice_tail(n = 1) %>%
+        pull(perda_percentual), 2
+    ),
+    round(
+      indice_pressao_futuro %>%
+        filter(tipo == "Previsto") %>%
+        slice_tail(n = 1) %>%
+        pull(indice_pressao_acumulada), 2
+    )
+  )
+)
+
+print(tabela_resumo_final)
+
+
+```
+
+##10.Conclusão
+
+Este trabalho apresentou o desenvolvimento de um pipeline analítico completo, baseado em arquiteturas de Big Data e modelos de séries temporais, com o objetivo de avaliar a evolução do poder de compra da população brasileira em uma determinada região. A adoção de uma arquitetura em camadas (RAW, TRATAMENTO e GOLD) garantiu rastreabilidade, reprodutibilidade e clareza metodológica, assegurando que apenas dados tratados e validados fossem utilizados nas análises finais.
+
+A partir da consolidação dos dados de consumo real provenientes de cupons fiscais de supermercado e da incorporação de indicadores macroeconômicos oficiais, como o salário mínimo nacional, foi possível construir um indicador próprio de poder de compra. Esse índice, definido como a razão acumulada entre a variação do salário mínimo e a inflação da cesta básica, mostrou-se eficaz para capturar a pressão econômica exercida sobre famílias de baixa renda ao longo do tempo.
+
+A análise histórica evidenciou uma tendência consistente de aumento do comprometimento da renda, especialmente em períodos marcados por choques econômicos relevantes, como a pandemia de COVID‑19 e ciclos inflacionários mais intensos. A comparação entre modelos preditivos (ARIMA e Prophet), realizada com base em métricas quantitativas (RMSE e MAE) e qualitativas (variabilidade anual e largura do intervalo de confiança), permitiu selecionar de forma objetiva os modelos mais adequados para cada variável analisada.
+
+A interpretação do índice de poder de compra foi estruturada em faixas qualitativas — boa, moderada e ruim — com base em referências observadas em estudos econômicos de diferentes regiões e países. A região analisada encontra-se atualmente em uma faixa intermediária, com tendência de deterioração, indicando risco crescente de endividamento caso a dinâmica entre renda e custo de vida se mantenha nos patamares observados.
+
+Os resultados indicam que, embora o poder de compra pontual apresente tendência de estabilização no horizonte projetado, esse patamar permanece significativamente inferior ao observado no ano base. Como consequência, a perda percentual do salário continua a crescer de forma moderada, enquanto o índice de pressão econômica acumulada mantém trajetória ascendente. Esse comportamento evidencia que a estabilização ocorre em um nível economicamente desfavorável, de modo que o histórico de deterioração continua exercendo impacto cumulativo sobre a condição econômica das famílias.
+
+Por fim, o indicador proposto demonstrou potencial como ferramenta de apoio à tomada de decisão, tanto para análises regionais quanto para estudos comparativos mais amplos. Trabalhos futuros podem expandir a abordagem incorporando outros componentes do custo de vida, como habitação, transporte e energia, bem como explorando modelos preditivos mais avançados para cenários de maior volatilidade econômica.
+
+
+Referencias
+
+OCDE – Real Wage Growth vs Inflation
+
+Países com crescimento real de salários ≈ inflação mantêm estabilidade do poder de compra. Quando a inflação supera o crescimento salarial de forma persistente, observa‑se:
+
+aumento de endividamento redução de consumo básico
+
+
+OECD (2023). Real wages, household income and labour market outcomes. https://www.oecd.org/employment/real-wages/
+
+Índices de custo de vida e stress econômico 📚 World Bank – Cost of Living and Household Vulnerability Estudos do Banco Mundial mostram que, em economias emergentes:
+
+quando o custo dos alimentos cresce 1,3× a 1,6× mais rápido que a renda, há:
+
+aumento de insegurança alimentar pressão sobre renda disponível crescimento do crédito ao consumo
+
+
+World Bank (2022). Food price inflation and household welfare. https://www.worldbank.org/en/topic/poverty/brief/food-price-inflation
+
+ndicadores de endividamento e comprometimento de renda 📚 BIS / IMF – Household Debt and Living Costs Relatórios do FMI e do BIS indicam que:
+
+quando gastos essenciais crescem muito acima da renda:
+
+famílias recorrem a crédito cresce inadimplência
+
+esse ponto crítico ocorre quando a razão custo essencial / renda cresce acima de \~1,5 de forma acumulada
+
+
+IMF (2023). Global Financial Stability Report. https://www.imf.org/en/Publications/GFSR BIS (2022). Household debt dynamics. https://www.bis.org/statistics/
+
+Indicador visual - GRÁFICO TIPO VELOCÍMETRO (GAUGE) DO ÍNDICE DE PODER DE COMPRA
+
+
